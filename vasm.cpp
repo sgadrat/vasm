@@ -1,9 +1,3 @@
-// (C)2020 Jannik Vogel
-// (C)2022 Sylvain Gadrat
-//
-// Use like:
-// g++ `pkg-config --libs --cflags fmt` vasm.cpp -o vasm
-
 #include <fmt/core.h>
 
 #include <cstdint>
@@ -15,6 +9,8 @@
 #include <vector>
 #include <stdexcept>
 #include <regex>
+
+// g++ -std=c++20 `pkg-config --libs --cflags fmt` vasm.cpp -o vasm
 
 typedef enum {
 	A_ADD=0,
@@ -153,11 +149,16 @@ static std::string lower(std::string val) {
 	return val;
 }
 
-class ParseError : std::runtime_error {
+class ParseError : public std::runtime_error {
 	public:
 	ParseError(std::string msg): std::runtime_error(msg) {}
 };
 
+/**
+ * Return the value of an address parameter.
+ *
+ * If the address is valid but cannot be determined, returns 0 and mark its position for resolution during the second pass.
+ */
 static uint16_t get_addr(
 	std::string value,
 	std::map<std::string, uint16_t> const& symbols,
@@ -200,6 +201,46 @@ static uint16_t get_addr(
 	}
 
 	return 0;
+}
+
+/**
+ * Return the value of a parameter.
+ *
+ * Known labels can be used in resolution, but unknowns will trigger an error.
+ */
+static uint16_t get_value(
+	std::string value,
+	std::map<std::string, uint16_t> const& symbols
+)
+{
+	if (value.empty()) {
+		throw ParseError("invalid value <empty string>");
+	}
+
+	try {
+		if (value[0] == '$') {
+			// Hexadecimal value
+			return std::stoul(std::string(value, 1), nullptr, 16);
+		}else if (value[0] == '%') {
+			// Binary value
+			return std::stoul(std::string(value, 1), nullptr, 2);
+		}else if (value[0] >= '0' and value[0] <= '9') {
+			// Decimal value
+			return std::stoul(value, nullptr, 10);
+		}else {
+			// Symbol name
+			auto symbol_it = symbols.find(value);
+			if (symbol_it != symbols.end()) {
+				// Known symbol, use its value
+				return symbol_it->second;
+			}else {
+				// Unknown symbol
+				throw ParseError(fmt::format("unresolved symbol '{}'", value));
+			}
+		}
+	}catch (std::invalid_argument const& e) {
+		throw ParseError("invalid number format");
+	}
 }
 
 static Register parse_register_name(std::string name) {
@@ -263,6 +304,8 @@ int main(int argc, char** argv) {
 		src_file.close();
 
 		// First pass: read the file, generate the code with placeholders where necessary
+		g_error_count = 0;
+
 		uint16_t mem[0x20000];
 		memset(mem, 0x00, sizeof(mem));
 		Instruction* cursor = reinterpret_cast<Instruction*>(mem);
@@ -300,7 +343,7 @@ int main(int argc, char** argv) {
 			std::string instruction = matches[4];
 			std::string str_parameters = matches[6];
 			std::vector<std::string> parameters;
-			std::cerr << "dbg: " << line_num << ": label=" << label << " op=" << instruction << " params='" << str_parameters << "'\n";
+			//std::cerr << "dbg: " << line_num << ": label=" << label << " op=" << instruction << " params='" << str_parameters << "'\n";
 
 			if (!label.empty()) {
 				// Remove the final ':'
@@ -331,6 +374,62 @@ int main(int argc, char** argv) {
 
 			// Generate instruction code
 			if (instruction.empty()) {
+			}else if (instruction == ".word") {
+				if (parameters.size() < 1) {
+					error(line_num, ".WORD requires at least 1 parameter (value)");
+				}else {
+					for (auto str_value: parameters) {
+						uint16_t value = 0;
+						try {
+							value = get_addr(str_value, symbols, unresolved_symbols, cursor, line_num);
+						}catch (ParseError const& e) {
+							error(line_num, fmt::format(".WORD unable to parse value '{}': {}", str_value, e.what()));
+						}
+						cursor->raw = value;
+						++cursor;
+						++pc;
+					}
+				}
+			}else if (instruction == ".dsb") {
+				if (parameters.size() != 2) {
+					error(line_num, ".DSB requires 2 parameters (value, count)");
+				}else {
+					uint16_t value = 0;
+					uint16_t count = 0;
+					try {
+						value = get_value(parameters[0], symbols);
+					}catch (ParseError const& e) {
+						error(line_num, fmt::format(".DSB unable to parse value '{}': {}", parameters[0], e.what()));
+					}
+					try {
+						count = get_value(parameters[1], symbols);
+					}catch (ParseError const& e) {
+						error(line_num, fmt::format(".DSB unable to parse count '{}': {}", parameters[1], e.what()));
+					}
+
+					while (count > 0) {
+						cursor->raw = value;
+						++cursor;
+						++pc;
+						--count;
+					}
+				}
+			}else if (instruction == ".label") {
+				if (parameters.size() != 2) {
+					error(line_num, ".LABEL requires 2 parameters (name, value)");
+				}else {
+					std::string label = parameters[0];
+					uint16_t value = 0;
+					try {
+						value = get_value(parameters[1], symbols);
+					}catch (ParseError const& e) {
+						error(line_num, fmt::format(".LABEL unable to parse value '{}': {}", parameters[1], e.what()));
+					}
+
+					if (symbols.insert(std::pair<std::string, uint16_t>(label, value)).second == false) {
+						error(line_num, fmt::format("redefining label '{}'", label));
+					}
+				}
 			}else if (instruction == "load") {
 				if (parameters.size() != 2) {
 					error(line_num, "LOAD requires 2 parameters (register, address)");
@@ -353,7 +452,6 @@ int main(int argc, char** argv) {
 
 					if (! has_error) {
 						uint16_t size = asm_load(cursor, reg, addr);
-						std::cerr << "dbg: asm_load(" << (((uint16_t*)cursor) - mem) << ", " << parameters[0] << ", " << addr << ") -> " << size << '\n';
 						cursor += size;
 						pc += size;
 					}
